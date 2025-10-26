@@ -1,0 +1,424 @@
+name: CI/CD with MLOps Pipeline
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  MLFLOW_TRACKING_URI: file:./mlruns
+
+jobs:
+  mlops-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install numpy scikit-learn mlflow --break-system-packages
+
+      - name: Setup Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: devops-test
+          config: k8s/kind-config.yaml
+          wait: 120s
+
+      - name: Verify cluster
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Install Istio
+        run: |
+          chmod +x scripts/deploy-istio.sh
+          ./scripts/deploy-istio.sh
+
+      - name: Wait for Istio to be ready
+        run: |
+          kubectl wait --for=condition=ready pod --all -n istio-system --timeout=300s
+
+      - name: Deploy applications
+        run: |
+          chmod +x scripts/deploy-apps.sh
+          ./scripts/deploy-apps.sh
+
+      - name: Wait for applications to be ready
+        run: |
+          kubectl wait --for=condition=ready pod --all -n default --timeout=120s
+
+      - name: Run health checks
+        run: |
+          chmod +x scripts/health-check.sh
+          ./scripts/health-check.sh
+
+      - name: Run load tests (baseline)
+        run: |
+          chmod +x scripts/load-test.py
+          python3 scripts/load-test.py
+          cp loadtest-results.json loadtest-baseline.json
+
+      # ============ MLOps Pipeline Start ============
+
+      - name: Train ML model
+        run: |
+          python3 scripts/train_model.py
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ml-model
+          path: |
+            k8s_config_model.pkl
+            model_metadata.json
+
+      - name: Install and configure metrics server
+        run: |
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+          kubectl patch deployment metrics-server -n kube-system --type='json' \
+            -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+          
+          echo "⏳ Waiting for metrics server to be ready..."
+          sleep 30
+
+      - name: Collect cluster metrics
+        run: |
+          python3 scripts/collect_metrics.py
+
+      - name: ML-based auto-scaling
+        run: |
+          python3 scripts/auto_scale.py
+
+      - name: Wait for scaling to take effect
+        run: |
+          echo "⏳ Waiting for scaling changes to propagate..."
+          sleep 20
+          kubectl get deployments -n default
+
+      - name: Run load tests (optimized)
+        run: |
+          python3 scripts/load-test.py
+          cp loadtest-results.json loadtest-optimized.json
+
+      - name: Compare baseline vs optimized performance
+        run: |
+          python3 - <<'EOF'
+          import json
+          
+          try:
+              with open('loadtest-baseline.json') as f:
+                  baseline = json.load(f)
+              
+              with open('loadtest-optimized.json') as f:
+                  optimized = json.load(f)
+              
+              baseline_rps = baseline['overall_stats']['requests_per_second']
+              optimized_rps = optimized['overall_stats']['requests_per_second']
+              rps_improvement = ((optimized_rps - baseline_rps) / baseline_rps) * 100
+              
+              baseline_latency = baseline['latency_stats']['p95_ms']
+              optimized_latency = optimized['latency_stats']['p95_ms']
+              latency_improvement = ((baseline_latency - optimized_latency) / baseline_latency) * 100
+              
+              baseline_success = baseline['overall_stats']['success_rate_percent']
+              optimized_success = optimized['overall_stats']['success_rate_percent']
+              
+              comparison = {
+                  'baseline': {
+                      'rps': baseline_rps,
+                      'p95_latency_ms': baseline_latency,
+                      'success_rate': baseline_success
+                  },
+                  'optimized': {
+                      'rps': optimized_rps,
+                      'p95_latency_ms': optimized_latency,
+                      'success_rate': optimized_success
+                  },
+                  'improvement': {
+                      'rps_percent': round(rps_improvement, 2),
+                      'latency_percent': round(latency_improvement, 2),
+                      'success_rate_delta': round(optimized_success - baseline_success, 2)
+                  }
+              }
+              
+              with open('performance-comparison.json', 'w') as f:
+                  json.dump(comparison, f, indent=2)
+              
+              print("\n" + "="*60)
+              print("📊 PERFORMANCE COMPARISON")
+              print("="*60)
+              print(f"\n📈 Baseline Performance:")
+              print(f"   • RPS: {baseline_rps:.2f} req/s")
+              print(f"   • P95 Latency: {baseline_latency:.2f}ms")
+              print(f"   • Success Rate: {baseline_success:.2f}%")
+              
+              print(f"\n🤖 ML-Optimized Performance:")
+              print(f"   • RPS: {optimized_rps:.2f} req/s")
+              print(f"   • P95 Latency: {optimized_latency:.2f}ms")
+              print(f"   • Success Rate: {optimized_success:.2f}%")
+              
+              print(f"\n📊 Improvement:")
+              print(f"   • RPS: {rps_improvement:+.2f}%")
+              print(f"   • Latency: {latency_improvement:+.2f}%")
+              print(f"   • Success Rate: {optimized_success - baseline_success:+.2f}%")
+              
+              if rps_improvement > 5:
+                  print("\n✅ ML optimization significantly improved performance!")
+              elif rps_improvement > -5:
+                  print("\n➡️  ML optimization maintained performance")
+              else:
+                  print("\n⚠️  ML optimization decreased performance")
+              
+              print("="*60 + "\n")
+                  
+          except Exception as e:
+              print(f"❌ Failed to compare results: {e}")
+              with open('performance-comparison.json', 'w') as f:
+                  json.dump({'error': str(e)}, f)
+          EOF
+
+      - name: Model evaluation and retraining decision
+        run: |
+          python3 - <<'EOF'
+          import json
+          
+          try:
+              with open('loadtest-optimized.json') as f:
+                  results = json.load(f)
+              
+              with open('performance-comparison.json') as f:
+                  comparison = json.load(f)
+              
+              success_rate = results['overall_stats']['success_rate_percent']
+              latency_p95 = results['latency_stats']['p95_ms']
+              improvement = comparison.get('improvement', {}).get('rps_percent', 0)
+              
+              # Decision logic
+              needs_retraining = (
+                  success_rate < 95 or 
+                  latency_p95 > 500 or 
+                  improvement < -10
+              )
+              
+              decision = {
+                  'needs_retraining': needs_retraining,
+                  'reasons': [],
+                  'metrics': {
+                      'success_rate': success_rate,
+                      'latency_p95': latency_p95,
+                      'rps_improvement': improvement
+                  }
+              }
+              
+              if success_rate < 95:
+                  decision['reasons'].append('Low success rate')
+              if latency_p95 > 500:
+                  decision['reasons'].append('High latency')
+              if improvement < -10:
+                  decision['reasons'].append('Performance degraded')
+              
+              if not needs_retraining:
+                  decision['reasons'] = ['Model performing well']
+              
+              with open('retrain-decision.json', 'w') as f:
+                  json.dump(decision, f, indent=2)
+              
+              print("\n" + "="*60)
+              print("🔬 MODEL EVALUATION")
+              print("="*60)
+              print(f"\nMetrics:")
+              print(f"   • Success Rate: {success_rate:.2f}%")
+              print(f"   • P95 Latency: {latency_p95:.2f}ms")
+              print(f"   • Performance Change: {improvement:+.2f}%")
+              
+              if needs_retraining:
+                  print(f"\n⚠️  Model retraining recommended!")
+                  print(f"   Reasons: {', '.join(decision['reasons'])}")
+              else:
+                  print(f"\n✅ Model performing well - no retraining needed")
+              
+              print("="*60 + "\n")
+                  
+          except Exception as e:
+              print(f"❌ Evaluation failed: {e}")
+              with open('retrain-decision.json', 'w') as f:
+                  json.dump({'error': str(e), 'needs_retraining': False}, f)
+          EOF
+
+      # ============ MLOps Pipeline End ============
+
+      - name: Format results for PR comment
+        if: always()
+        run: |
+          chmod +x scripts/format-results.sh
+          ./scripts/format-results.sh || echo "Format script not found, skipping..."
+
+      - name: Generate comprehensive MLOps report
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json
+          from datetime import datetime
+          
+          def load_json(file):
+              try:
+                  with open(file) as f:
+                      return json.load(f)
+              except:
+                  return {}
+          
+          metadata = load_json('model_metadata.json')
+          baseline = load_json('loadtest-baseline.json')
+          optimized = load_json('loadtest-optimized.json')
+          comparison = load_json('performance-comparison.json')
+          scaling = load_json('scaling-results.json')
+          retrain = load_json('retrain-decision.json')
+          
+          report = f"""# 🤖 MLOps CI/CD Pipeline Results
+          
+          ## 📊 Pipeline Summary
+          - **Timestamp**: {datetime.now().isoformat()}
+          - **Status**: {'✅ Success' if optimized.get('overall_stats', {}).get('success_rate_percent', 0) >= 95 else '⚠️ Needs Attention'}
+          - **Workflow**: Native CI/CD + MLOps
+          
+          ## 🧠 ML Model
+          - **Training R² Score**: {metadata.get('test_r2_score', metadata.get('score', 0)):.3f}
+          - **Training MSE**: {metadata.get('test_mse', 0):.3f}
+          - **Trained At**: {metadata.get('trained_at', 'N/A')}
+          
+          ## 🎯 ML-Predicted Configuration
+          - **Replicas**: {scaling.get('predicted_config', {}).get('replicas', 'N/A')}
+          - **CPU**: {scaling.get('predicted_config', {}).get('cpu_millicores', 'N/A')}m
+          - **Memory**: {scaling.get('predicted_config', {}).get('memory_mb', 'N/A')}Mi
+          
+          ## 📈 Performance Comparison
+          
+          ### Baseline (Before ML Optimization)
+          - **Throughput**: {comparison.get('baseline', {}).get('rps', 0):.2f} req/s
+          - **P95 Latency**: {comparison.get('baseline', {}).get('p95_latency_ms', 0):.2f}ms
+          - **Success Rate**: {comparison.get('baseline', {}).get('success_rate', 0):.2f}%
+          
+          ### Optimized (After ML Optimization)
+          - **Throughput**: {comparison.get('optimized', {}).get('rps', 0):.2f} req/s
+          - **P95 Latency**: {comparison.get('optimized', {}).get('p95_latency_ms', 0):.2f}ms
+          - **Success Rate**: {comparison.get('optimized', {}).get('success_rate', 0):.2f}%
+          
+          ### 🎯 Improvement
+          - **RPS**: {comparison.get('improvement', {}).get('rps_percent', 0):+.2f}%
+          - **Latency**: {comparison.get('improvement', {}).get('latency_percent', 0):+.2f}%
+          - **Success Rate**: {comparison.get('improvement', {}).get('success_rate_delta', 0):+.2f}%
+          
+          ## 📊 Detailed Optimized Results
+          - **Total Requests**: {optimized.get('test_info', {}).get('total_requests', 0)}
+          - **Concurrent Workers**: {optimized.get('test_info', {}).get('concurrent_workers', 0)}
+          - **Test Duration**: {optimized.get('test_info', {}).get('test_duration_seconds', 0):.2f}s
+          - **Mean Latency**: {optimized.get('latency_stats', {}).get('mean_ms', 0):.2f}ms
+          - **Median Latency**: {optimized.get('latency_stats', {}).get('median_ms', 0):.2f}ms
+          - **P90 Latency**: {optimized.get('latency_stats', {}).get('p90_ms', 0):.2f}ms
+          - **P99 Latency**: {optimized.get('latency_stats', {}).get('p99_ms', 0):.2f}ms
+          
+          ## 🔄 Model Retraining Decision
+          - **Needs Retraining**: {'Yes ⚠️' if retrain.get('needs_retraining') else 'No ✅'}
+          - **Reasons**: {', '.join(retrain.get('reasons', ['N/A']))}
+          
+          ## 📦 Deployed Services
+          """
+          
+          for result in scaling.get('scaling_results', []):
+              report += f"\n### {result['deployment']}\n"
+              report += f"- **Scaled**: {'✅' if result['scaled'] else '❌'}\n"
+              report += f"- **Replicas**: {result['config']['replicas']}\n"
+              report += f"- **CPU**: {result['config']['cpu_millicores']}m\n"
+              report += f"- **Memory**: {result['config']['memory_mb']}Mi\n"
+          
+          report += f"""
+          
+          ## 🔬 Per-Host Statistics
+          """
+          
+          for host, stats in optimized.get('host_stats', {}).items():
+              report += f"\n### {host}\n"
+              report += f"- **Requests**: {stats.get('total_requests', 0)}\n"
+              report += f"- **Success Rate**: {stats.get('success_rate_percent', 0):.2f}%\n"
+              if 'latency' in stats:
+                  report += f"- **Mean Latency**: {stats['latency'].get('mean_ms', 0):.2f}ms\n"
+                  report += f"- **P95 Latency**: {stats['latency'].get('p95_ms', 0):.2f}ms\n"
+          
+          report += """
+          
+          ---
+          
+          **🤖 Powered by MLOps Pipeline with Machine Learning Auto-Scaling**
+          """
+          
+          with open('mlops-report.md', 'w') as f:
+              f.write(report)
+          
+          print(report)
+          EOF
+
+      - name: Upload all artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-results
+          path: |
+            k8s_config_model.pkl
+            model_metadata.json
+            cluster-metrics.json
+            scaling-results.json
+            loadtest-baseline.json
+            loadtest-optimized.json
+            loadtest-results.json
+            loadtest-results.md
+            performance-comparison.json
+            retrain-decision.json
+            mlops-report.md
+            github-comment.md
+            mlruns/
+
+      - name: Post MLOps report to PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let report = '';
+            
+            // Try to use MLOps report first, fall back to formatted comment
+            try {
+              report = fs.readFileSync('mlops-report.md', 'utf8');
+            } catch (error) {
+              try {
+                report = fs.readFileSync('github-comment.md', 'utf8');
+              } catch (error2) {
+                report = '❌ Failed to generate report';
+              }
+            }
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kind delete cluster --name devops-test || true
