@@ -422,4 +422,3 @@ jobs:
         if: always()
         run: |
           kind delete cluster --name rohit-mlops-test || true
-          
