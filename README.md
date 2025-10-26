@@ -518,4 +518,4 @@ This project is for educational and evaluation purposes.
 
 ---
 
-**Key Improvement:** All networking issues in Kind clusters are resolved by using `kubectl exec` to run commands inside the cluster instead of trying to access NodePort from outside. This makes the pipeline reliable and production-ready for CI/CD environments.
+**Key Improvement:** All networking issues in Kind clusters are resolved by using `kubectl exec` to run commands inside the cluster instead of trying to access NodePort from outside. This makes the pipeline reliable and production-ready for CI/CD environments..
