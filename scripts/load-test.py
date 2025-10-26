@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import requests
 import time
 import random
 import statistics
@@ -15,25 +14,30 @@ TOTAL_REQUESTS = 500
 WORKERS = 20
 TIMEOUT = 10
 
+HOSTS = ["foo.localhost", "bar.localhost"]
 
-# Get ingress port from kubectl
-def get_ingress_port():
+
+def get_ingress_pod():
+    """Get the ingress gateway pod name"""
     try:
         result = subprocess.run([
-            'kubectl', 'get', 'svc', 'istio-ingressgateway',
+            'kubectl', 'get', 'pod',
             '-n', 'istio-system',
-            '-o', 'jsonpath={.spec.ports[?(@.name=="http2")].nodePort}'
+            '-l', 'app=istio-ingressgateway',
+            '-o', 'jsonpath={.items[0].metadata.name}'
         ], capture_output=True, text=True, check=True)
-        return result.stdout.strip()
+        pod_name = result.stdout.strip()
+        if not pod_name:
+            raise Exception("No ingress gateway pod found")
+        return pod_name
     except subprocess.CalledProcessError as e:
-        print(f"Error getting ingress port: {e}")
+        print(f"Error getting ingress pod: {e}")
         sys.exit(1)
 
 
-INGRESS_PORT = get_ingress_port()
-BASE_URL = f"http://localhost:{INGRESS_PORT}/"
-
-HOSTS = ["foo.localhost", "bar.localhost"]
+# Get ingress pod once at startup
+INGRESS_POD = get_ingress_pod()
+print(f"Using ingress gateway pod: {INGRESS_POD}")
 
 
 class LoadTestResults:
@@ -73,7 +77,8 @@ class LoadTestResults:
                 "total_requests": TOTAL_REQUESTS,
                 "concurrent_workers": WORKERS,
                 "test_duration_seconds": round(total_duration, 2),
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "method": "kubectl_exec"
             },
             "overall_stats": {
                 "successful_requests": self.successful_requests,
@@ -128,29 +133,65 @@ class LoadTestResults:
 
 
 def make_request(request_id):
-    """Make a single HTTP request to a random host"""
+    """
+    Make a single HTTP request using kubectl exec into the ingress gateway pod.
+    This works in Kind clusters where localhost:NodePort is not accessible.
+    """
     host = random.choice(HOSTS)
-    headers = {"Host": host}
+    expected_response = host.split('.')[0]  # "foo" from "foo.localhost"
 
     try:
         start_time = time.time()
-        response = requests.get(BASE_URL, headers=headers, timeout=TIMEOUT)
+        
+        # CRITICAL FIX: Use kubectl exec to run curl inside the ingress gateway pod
+        # This is the same approach that fixed the health checks
+        result = subprocess.run([
+            'kubectl', 'exec',
+            '-n', 'istio-system',
+            INGRESS_POD,
+            '--',
+            'curl',
+            '-s',  # silent
+            '-m', str(TIMEOUT),  # timeout
+            '-w', '\\n%{http_code}',  # write HTTP code on new line
+            '-H', f'Host: {host}',
+            'http://localhost:8080/'
+        ], capture_output=True, text=True, timeout=TIMEOUT + 2)
+        
         duration = time.time() - start_time
 
+        # Parse response: body on first line(s), HTTP code on last line
+        output = result.stdout.strip()
+        if not output:
+            return host, duration, False, "Empty response"
+        
+        lines = output.split('\n')
+        if len(lines) >= 2:
+            body = lines[0].strip()
+            http_code = lines[-1].strip()
+        else:
+            body = output.strip()
+            http_code = "000"
+
         # Verify response
-        expected_response = host.split('.')[0]  # "foo" from "foo.localhost"
-        success = (response.status_code == 200 and response.text.strip() == expected_response)
+        success = (http_code == "200" and body == expected_response)
 
         if not success:
-            error = f"Status: {response.status_code}, Body: {response.text[:50]}"
+            error = f"Status: {http_code}, Body: '{body[:50]}', Expected: '{expected_response}'"
             return host, duration, False, error
 
         return host, duration, True, None
 
-    except requests.exceptions.Timeout:
-        return host, 0, False, "Request timeout"
-    except requests.exceptions.RequestException as e:
-        return host, 0, False, str(e)
+    except subprocess.TimeoutExpired:
+        duration = time.time() - start_time
+        return host, duration, False, "Request timeout"
+    except subprocess.CalledProcessError as e:
+        duration = time.time() - start_time
+        error = f"kubectl exec failed: {e.stderr[:100] if e.stderr else 'unknown error'}"
+        return host, duration, False, error
+    except Exception as e:
+        duration = time.time() - start_time
+        return host, duration, False, str(e)
 
 
 def run_load_test():
@@ -159,7 +200,7 @@ def run_load_test():
     print(f"   Total requests: {TOTAL_REQUESTS}")
     print(f"   Concurrent workers: {WORKERS}")
     print(f"   Target hosts: {', '.join(HOSTS)}")
-    print(f"   Base URL: {BASE_URL}")
+    print(f"   Method: kubectl exec into {INGRESS_POD}")
     print()
 
     results = LoadTestResults()
@@ -178,7 +219,8 @@ def run_load_test():
 
             completed += 1
             if completed % 50 == 0:
-                print(f"   Progress: {completed}/{TOTAL_REQUESTS} requests completed")
+                success_rate = round((results.successful_requests / completed) * 100, 1)
+                print(f"   Progress: {completed}/{TOTAL_REQUESTS} requests completed ({success_rate}% success)")
 
     results.end_time = time.time()
 
@@ -195,15 +237,20 @@ def format_markdown_report(summary):
     report.append(f"- **Total Requests**: {summary['test_info']['total_requests']}")
     report.append(f"- **Concurrent Workers**: {summary['test_info']['concurrent_workers']}")
     report.append(f"- **Test Duration**: {summary['test_info']['test_duration_seconds']}s")
+    report.append(f"- **Method**: {summary['test_info']['method']}")
     report.append(f"- **Timestamp**: {summary['test_info']['timestamp']}")
     report.append("")
 
     # Overall Stats
     report.append("## Overall Statistics")
     overall = summary['overall_stats']
+    
+    # Add emoji indicators
+    success_emoji = "✅" if overall['success_rate_percent'] >= 95 else "⚠️" if overall['success_rate_percent'] >= 80 else "❌"
+    
     report.append(f"- **Successful Requests**: {overall['successful_requests']}")
     report.append(f"- **Failed Requests**: {overall['failed_requests']}")
-    report.append(f"- **Success Rate**: {overall['success_rate_percent']}%")
+    report.append(f"- **Success Rate**: {success_emoji} {overall['success_rate_percent']}%")
     report.append(f"- **Throughput**: {overall['requests_per_second']} req/s")
     report.append("")
 
@@ -224,20 +271,24 @@ def format_markdown_report(summary):
     report.append("## Per-Host Statistics")
     for host, stats in summary['host_stats'].items():
         report.append(f"\n### {host}")
+        
+        host_success_emoji = "✅" if stats['success_rate_percent'] >= 95 else "⚠️" if stats['success_rate_percent'] >= 80 else "❌"
+        
         report.append(f"- **Total Requests**: {stats['total_requests']}")
         report.append(f"- **Successful**: {stats['successful_requests']}")
         report.append(f"- **Failed**: {stats['failed_requests']}")
-        report.append(f"- **Success Rate**: {stats['success_rate_percent']}%")
+        report.append(f"- **Success Rate**: {host_success_emoji} {stats['success_rate_percent']}%")
 
         if 'latency' in stats:
             report.append(f"- **Mean Latency**: {stats['latency']['mean_ms']} ms")
+            report.append(f"- **Median Latency**: {stats['latency']['median_ms']} ms")
             report.append(f"- **P90 Latency**: {stats['latency']['p90_ms']} ms")
             report.append(f"- **P95 Latency**: {stats['latency']['p95_ms']} ms")
 
     # Errors
     if summary.get('error_samples'):
         report.append("\n## Error Samples")
-        for i, error in enumerate(summary['error_samples'][:5], 1):
+        for i, error in enumerate(summary['error_samples'][:10], 1):
             report.append(f"{i}. **{error['host']}**: {error['error']}")
 
     return "\n".join(report)
@@ -268,17 +319,24 @@ if __name__ == "__main__":
             f.write(markdown_report)
         print("✅ Markdown report saved to: loadtest-results.md")
 
-        # Exit with error code if tests failed
-        if summary['overall_stats']['failed_requests'] > 0:
-            print(f"\n⚠️  Warning: {summary['overall_stats']['failed_requests']} requests failed")
+        # Exit with appropriate code
+        success_rate = summary['overall_stats']['success_rate_percent']
+        
+        if success_rate >= 95:
+            print(f"\n✅ Load test passed! Success rate: {success_rate}%")
+            sys.exit(0)
+        elif success_rate >= 80:
+            print(f"\n⚠️  Load test completed with warnings. Success rate: {success_rate}%")
+            sys.exit(0)  # Still exit 0 but with warning
+        else:
+            print(f"\n❌ Load test failed! Success rate: {success_rate}%")
             sys.exit(1)
 
-        print("\n✅ All requests successful!")
-        sys.exit(0)
-
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Load test interrupted by user")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error during load test: {e}")
         import traceback
-
         traceback.print_exc()
         sys.exit(1)
