@@ -1,4 +1,4 @@
-# Kubernetes Load Testing Pipeline
+# Kubernetes End-End Deployment, Health Checks, Load Testing, Auto Comment in PR etc usig Native(traditional) CI-CD Pipeline.
 
 Automated CI/CD pipeline for deploying and load testing microservices on a multi-node Kubernetes cluster using Istio service mesh.
 
