@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: bar-service
+  namespace: default
+  labels:
+    app: bar
+spec:
+  selector:
+    app: bar
+  ports:
+  - name: http
+    port: 80
+    targetPort: 5678
+    protocol: TCP
+  type: ClusterIP
