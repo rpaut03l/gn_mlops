@@ -11,42 +11,29 @@ echo "=== Running Health Checks ==="
 # Function to check endpoint
 check_endpoint() {
     local host=$1
-    local expected_response=$2
-    local retries=0
+    local expected=$2
+    local retries=30
     
-    echo "🔍 Checking endpoint: ${host}"
+    echo "🔍 Checking ${host}..."
     
-    while [ $retries -lt $MAX_RETRIES ]; do
-        # Get ingress gateway NodePort
-        INGRESS_PORT=$(kubectl get svc istio-ingressgateway -n istio-system \
-            -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}' 2>/dev/null || echo "")
+    # Get ingress gateway pod
+    INGRESS_POD=$(kubectl get pod -n istio-system -l app=istio-ingressgateway -o jsonpath='{.items[0].metadata.name}')
+    
+    for i in $(seq 1 $retries); do
+        # Execute curl FROM INSIDE the ingress gateway pod (this is the key fix!)
+        response=$(kubectl exec -n istio-system "${INGRESS_POD}" -- \
+            curl -s -m 5 -H "Host: ${host}" http://localhost:8080/ 2>/dev/null || echo "")
         
-        if [ -z "$INGRESS_PORT" ]; then
-            echo "❌ Failed to get ingress port"
-            return 1
-        fi
-        
-        # Try to access the endpoint with more verbose output
-        response=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Host: ${host}" \
-            "http://localhost:${INGRESS_PORT}/" 2>/dev/null || echo "CURL_FAILED")
-        
-        # Extract HTTP code and body
-        http_code=$(echo "$response" | grep "HTTP_CODE:" | cut -d':' -f2)
-        body=$(echo "$response" | grep -v "HTTP_CODE:")
-        
-        if [ "$body" == "$expected_response" ]; then
-            echo "✅ ${host} is healthy (response: ${body}, HTTP: ${http_code})"
+        if [ "$response" == "$expected" ]; then
+            echo "✅ ${host} is healthy"
             return 0
         fi
         
-        retries=$((retries + 1))
-        if [ $retries -lt $MAX_RETRIES ]; then
-            echo "⏳ Attempt $retries/${MAX_RETRIES}: Waiting for ${host}... (got: '${body}', HTTP: ${http_code})"
-            sleep $RETRY_DELAY
-        fi
+        echo "⏳ Attempt $i/$retries: got '${response}', expected '${expected}'"
+        sleep 3
     done
     
-    echo "❌ ${host} health check failed after ${MAX_RETRIES} attempts"
+    echo "❌ ${host} failed after $retries attempts"
     return 1
 }
 
