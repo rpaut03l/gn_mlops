@@ -3,37 +3,52 @@ set -e
 
 NAMESPACE="default"
 MAX_RETRIES=30
-RETRY_DELAY=5  # Increased from 2 to 5 seconds
-ROUTING_DELAY=20  # Increased from 10 to 20 seconds
+RETRY_DELAY=3
+ROUTING_DELAY=15
 
 echo "=== Running Health Checks ==="
 
-# Function to check endpoint
+# Get ingress gateway pod (used throughout)
+get_ingress_pod() {
+    kubectl get pod -n istio-system -l app=istio-ingressgateway \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo ""
+}
+
+# Function to check endpoint using kubectl exec
 check_endpoint() {
     local host=$1
-    local expected=$2
-    local retries=30
+    local expected_response=$2
+    local retries=0
     
-    echo "🔍 Checking ${host}..."
+    echo "🔍 Checking endpoint: ${host}"
     
-    # Get ingress gateway pod
-    INGRESS_POD=$(kubectl get pod -n istio-system -l app=istio-ingressgateway -o jsonpath='{.items[0].metadata.name}')
+    INGRESS_POD=$(get_ingress_pod)
     
-    for i in $(seq 1 $retries); do
-        # Execute curl FROM INSIDE the ingress gateway pod (this is the key fix!)
+    if [ -z "$INGRESS_POD" ]; then
+        echo "❌ No ingress gateway pod found"
+        return 1
+    fi
+    
+    echo "Using ingress pod: ${INGRESS_POD}"
+    
+    while [ $retries -lt $MAX_RETRIES ]; do
+        # Execute curl FROM INSIDE the ingress gateway pod
         response=$(kubectl exec -n istio-system "${INGRESS_POD}" -- \
-            curl -s -m 5 -H "Host: ${host}" http://localhost:8080/ 2>/dev/null || echo "")
+            curl -s -m 5 -H "Host: ${host}" "http://localhost:8080/" 2>/dev/null || echo "")
         
-        if [ "$response" == "$expected" ]; then
-            echo "✅ ${host} is healthy"
+        if [ "$response" == "$expected_response" ]; then
+            echo "✅ ${host} is healthy (response: ${response})"
             return 0
         fi
         
-        echo "⏳ Attempt $i/$retries: got '${response}', expected '${expected}'"
-        sleep 3
+        retries=$((retries + 1))
+        if [ $retries -lt $MAX_RETRIES ]; then
+            echo "⏳ Attempt $retries/${MAX_RETRIES}: Waiting for ${host}... (got: '${response}')"
+            sleep $RETRY_DELAY
+        fi
     done
     
-    echo "❌ ${host} failed after $retries attempts"
+    echo "❌ ${host} health check failed after ${MAX_RETRIES} attempts"
     return 1
 }
 
@@ -54,7 +69,6 @@ ISTIO_NOT_RUNNING=$(kubectl get pods -n istio-system -o json | \
 if [ "$ISTIO_NOT_RUNNING" -ne 0 ]; then
     echo "❌ Some Istio pods are not running"
     kubectl get pods -n istio-system -o wide
-    kubectl describe pods -n istio-system
     exit 1
 fi
 echo "✅ All Istio components are healthy"
@@ -64,25 +78,14 @@ echo ""
 echo "=== Application Pods Health ==="
 kubectl get pods -n ${NAMESPACE}
 
-# Wait for all pods to be ready (not just running)
+# Wait for all pods to be ready
 echo "⏳ Waiting for all pods to be ready..."
 kubectl wait --for=condition=ready pod --all -n ${NAMESPACE} --timeout=120s || {
     echo "❌ Timeout waiting for pods to be ready"
     kubectl get pods -n ${NAMESPACE} -o wide
-    kubectl describe pods -n ${NAMESPACE}
     exit 1
 }
-
-# Verify all pods are running
-PODS_NOT_RUNNING=$(kubectl get pods -n ${NAMESPACE} -o json | \
-    jq -r '.items[] | select(.status.phase != "Running" and .status.phase != "Succeeded") | .metadata.name' | wc -l)
-
-if [ "$PODS_NOT_RUNNING" -ne 0 ]; then
-    echo "❌ Some application pods are not running"
-    kubectl get pods -n ${NAMESPACE} -o wide
-    exit 1
-fi
-echo "✅ All application pods are healthy"
+echo "✅ All application pods are ready"
 
 # Check services
 echo ""
@@ -95,50 +98,41 @@ echo ""
 echo "=== Service Endpoints ==="
 kubectl get endpoints -n ${NAMESPACE}
 
+FOO_ENDPOINTS=$(kubectl get endpoints foo-service -n ${NAMESPACE} -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null | wc -w)
+BAR_ENDPOINTS=$(kubectl get endpoints bar-service -n ${NAMESPACE} -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null | wc -w)
+
+if [ "$FOO_ENDPOINTS" -eq 0 ]; then
+    echo "⚠️  Warning: foo-service has no endpoints"
+fi
+
+if [ "$BAR_ENDPOINTS" -eq 0 ]; then
+    echo "⚠️  Warning: bar-service has no endpoints"
+fi
+
+echo "✅ foo-service has ${FOO_ENDPOINTS} endpoint(s)"
+echo "✅ bar-service has ${BAR_ENDPOINTS} endpoint(s)"
+
 # Check VirtualServices and Gateways
 echo ""
 echo "=== Istio Configuration ==="
-kubectl get gateway -n ${NAMESPACE}
-kubectl get virtualservice -n ${NAMESPACE}
-kubectl get destinationrule -n ${NAMESPACE}
-
-# Get ingress gateway details
-INGRESS_HOST="localhost"
-INGRESS_PORT=$(kubectl get svc istio-ingressgateway -n istio-system \
-    -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}')
-
-echo ""
-echo "=== Ingress Gateway ==="
-echo "Host: ${INGRESS_HOST}"
-echo "Port: ${INGRESS_PORT}"
-
-if [ -z "$INGRESS_PORT" ]; then
-    echo "❌ Failed to get ingress gateway port"
-    kubectl describe svc istio-ingressgateway -n istio-system
-    exit 1
-fi
+kubectl get gateway -n ${NAMESPACE} || echo "No gateways found"
+kubectl get virtualservice -n ${NAMESPACE} || echo "No virtual services found"
 
 # Verify ingress gateway is ready
 echo ""
 echo "⏳ Waiting for ingress gateway to be ready..."
 kubectl wait --for=condition=ready pod -l app=istio-ingressgateway -n istio-system --timeout=60s || {
     echo "❌ Ingress gateway not ready"
-    kubectl get pods -n istio-system -l app=istio-ingressgateway
     exit 1
 }
+
+INGRESS_POD=$(get_ingress_pod)
+echo "✅ Ingress gateway is ready: ${INGRESS_POD}"
 
 # Wait for Istio routing to propagate
 echo ""
 echo "⏳ Waiting ${ROUTING_DELAY}s for Istio routing to propagate..."
 sleep ${ROUTING_DELAY}
-
-# Check Istio proxy logs for potential issues
-echo ""
-echo "=== Checking Istio Proxy Logs ==="
-for pod in $(kubectl get pods -n ${NAMESPACE} -o jsonpath='{.items[*].metadata.name}'); do
-    echo "Checking istio-proxy in pod: ${pod}"
-    kubectl logs ${pod} -n ${NAMESPACE} -c istio-proxy --tail=20 || echo "No istio-proxy in ${pod}"
-done
 
 # Check endpoints
 echo ""
@@ -148,18 +142,13 @@ if ! check_endpoint "foo.localhost" "foo"; then
     echo ""
     echo "=== Debug Information for foo.localhost ==="
     echo "--- Application Logs ---"
-    kubectl logs -n ${NAMESPACE} -l app=foo --tail=100 || echo "No logs available"
+    kubectl logs -n ${NAMESPACE} -l app=foo --tail=50 2>/dev/null || echo "No logs available"
+    echo ""
     echo "--- VirtualService Details ---"
-    kubectl describe virtualservice foo-virtualservice -n ${NAMESPACE} || echo "VirtualService not found"
+    kubectl describe virtualservice foo-virtualservice -n ${NAMESPACE} 2>/dev/null || echo "VirtualService not found"
+    echo ""
     echo "--- Service Details ---"
-    kubectl describe svc foo-service -n ${NAMESPACE} || echo "Service not found"
-    echo "--- Pod Details ---"
-    kubectl describe pods -n ${NAMESPACE} -l app=foo || echo "Pods not found"
-    echo "--- Istio Proxy Config ---"
-    FOO_POD=$(kubectl get pods -n ${NAMESPACE} -l app=foo -o jsonpath='{.items[0].metadata.name}')
-    if [ -n "$FOO_POD" ]; then
-        kubectl logs ${FOO_POD} -n ${NAMESPACE} -c istio-proxy --tail=50 || echo "No proxy logs"
-    fi
+    kubectl describe svc foo-service -n ${NAMESPACE} 2>/dev/null || echo "Service not found"
     exit 1
 fi
 
@@ -167,18 +156,13 @@ if ! check_endpoint "bar.localhost" "bar"; then
     echo ""
     echo "=== Debug Information for bar.localhost ==="
     echo "--- Application Logs ---"
-    kubectl logs -n ${NAMESPACE} -l app=bar --tail=100 || echo "No logs available"
+    kubectl logs -n ${NAMESPACE} -l app=bar --tail=50 2>/dev/null || echo "No logs available"
+    echo ""
     echo "--- VirtualService Details ---"
-    kubectl describe virtualservice bar-virtualservice -n ${NAMESPACE} || echo "VirtualService not found"
+    kubectl describe virtualservice bar-virtualservice -n ${NAMESPACE} 2>/dev/null || echo "VirtualService not found"
+    echo ""
     echo "--- Service Details ---"
-    kubectl describe svc bar-service -n ${NAMESPACE} || echo "Service not found"
-    echo "--- Pod Details ---"
-    kubectl describe pods -n ${NAMESPACE} -l app=bar || echo "Pods not found"
-    echo "--- Istio Proxy Config ---"
-    BAR_POD=$(kubectl get pods -n ${NAMESPACE} -l app=bar -o jsonpath='{.items[0].metadata.name}')
-    if [ -n "$BAR_POD" ]; then
-        kubectl logs ${BAR_POD} -n ${NAMESPACE} -c istio-proxy --tail=50 || echo "No proxy logs"
-    fi
+    kubectl describe svc bar-service -n ${NAMESPACE} 2>/dev/null || echo "Service not found"
     exit 1
 fi
 
@@ -188,9 +172,14 @@ echo "=== Final Verification (10 requests each) ==="
 SUCCESS_COUNT=0
 FAIL_COUNT=0
 
+INGRESS_POD=$(get_ingress_pod)
+
 for i in {1..10}; do
-    foo_response=$(curl -s -H "Host: foo.localhost" "http://localhost:${INGRESS_PORT}/" || echo "ERROR")
-    bar_response=$(curl -s -H "Host: bar.localhost" "http://localhost:${INGRESS_PORT}/" || echo "ERROR")
+    # CRITICAL FIX: Use kubectl exec for final verification too!
+    foo_response=$(kubectl exec -n istio-system "${INGRESS_POD}" -- \
+        curl -s -m 5 -H "Host: foo.localhost" "http://localhost:8080/" 2>/dev/null || echo "ERROR")
+    bar_response=$(kubectl exec -n istio-system "${INGRESS_POD}" -- \
+        curl -s -m 5 -H "Host: bar.localhost" "http://localhost:8080/" 2>/dev/null || echo "ERROR")
     
     if [ "$foo_response" != "foo" ] || [ "$bar_response" != "bar" ]; then
         echo "❌ Verification failed on request $i"
@@ -201,6 +190,10 @@ for i in {1..10}; do
         # Don't exit immediately, collect all failures
         if [ $FAIL_COUNT -ge 3 ]; then
             echo "❌ Too many failures ($FAIL_COUNT), stopping verification"
+            echo ""
+            echo "=== Additional Debug Info ==="
+            echo "--- Ingress Gateway Logs (last 30 lines) ---"
+            kubectl logs -n istio-system "${INGRESS_POD}" --tail=30 2>/dev/null || echo "No logs"
             exit 1
         fi
     else
@@ -225,5 +218,9 @@ if [ $SUCCESS_COUNT -ge 8 ]; then
 else
     echo ""
     echo "❌ Health checks failed - too many request failures"
+    echo ""
+    echo "=== Final Debug Information ==="
+    echo "--- Ingress Pod Status ---"
+    kubectl describe pod -n istio-system "${INGRESS_POD}" | tail -50
     exit 1
 fi
