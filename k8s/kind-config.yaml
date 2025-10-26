@@ -1,0 +1,31 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: mlops-test
+nodes:
+  # Control plane node
+  - role: control-plane
+    kubeadmConfigPatches:
+    - |
+      kind: InitConfiguration
+      nodeRegistration:
+        kubeletExtraArgs:
+          node-labels: "ingress-ready=true"
+    extraPortMappings:
+    # Map port 80 for HTTP ingress
+    - containerPort: 30080
+      hostPort: 80
+      protocol: TCP
+    # Map port 443 for HTTPS ingress
+    - containerPort: 30443
+      hostPort: 443
+      protocol: TCP
+
+  # Worker node 1
+  - role: worker
+    labels:
+      node-type: worker
+
+  # Worker node 2
+  - role: worker
+    labels:
+      node-type: worker
