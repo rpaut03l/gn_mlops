@@ -346,7 +346,7 @@ rm -f github-comment.md
 
 ## 🤝 Contributing
 
-This is a take-home assignment project. For production use, consider:
+This is a test project. For production use, consider:
 - Adding proper TLS/SSL configuration
 - Implementing monitoring and observability
 - Adding security policies
