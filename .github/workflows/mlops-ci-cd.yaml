@@ -34,7 +34,7 @@ jobs:
       - name: Setup Kind cluster
         uses: helm/kind-action@v1
         with:
-          cluster_name: devops-test
+          cluster_name: rohit-mlops-test
           config: k8s/kind-config.yaml
           wait: 120s
 
@@ -421,4 +421,4 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kind delete cluster --name devops-test || true
+          kind delete cluster --name rohit-mlops-test || true
