@@ -733,8 +733,6 @@ After implementing this MLOps pipeline:
 
 ## 📄 License
 
-This project is for educational and demonstration purposes.
-
 ---
 
 **Built with ❤️ using Kubernetes, Istio, Python, scikit-learn, and MLOps best practices**
