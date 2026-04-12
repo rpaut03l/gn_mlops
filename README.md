@@ -1,4 +1,4 @@
-# Kubernetes MLOps (LifeCycle) CI/CD Pipeline
+# Kubernetes MLOps (LifeCycle) CI/CD/Training Pipeline
 
 Automated CI/CD pipeline with Machine Learning-based optimization for deploying and load testing microservices on a multi-node Kubernetes cluster using Istio service mesh.
 
